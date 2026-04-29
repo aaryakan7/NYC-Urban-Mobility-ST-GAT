@@ -3,20 +3,39 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from models import model
 from models.model import STGAT
+import itertools
+from tqdm import tqdm
 
 class NYCTaxiDataset(Dataset):
-    def __init__(self, X, Y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.Y = torch.tensor(Y, dtype=torch.float32)
+    def __init__(self, node_features, demand_data, indices, seq_len):
+        self.node_features = torch.tensor(node_features, dtype=torch.float32)
+        self.demand_data = torch.tensor(demand_data, dtype=torch.float32)
+        self.indices = indices
+        self.seq_len = seq_len
         
     def __len__(self):
-        return len(self.X)
+        return len(self.indices)
         
     def __getitem__(self, idx):
-        return self.X[idx], self.Y[idx]
+        start_idx = self.indices[idx]
+        end_idx = start_idx + self.seq_len
+        
+        # Ensure end_idx does not exceed the length of demand_data
+        if end_idx >= len(self.demand_data):
+            end_idx = len(self.demand_data) - 1 
+        
+        # FIXED: Removed the '+ 1' to close the data leak!
+        # X is exactly seq_len steps (e.g., 0 to 47)
+        X = self.node_features[start_idx : end_idx]  
+        
+        # Y is the target step (e.g., 48)
+        Y = self.demand_data[end_idx].unsqueeze(-1) 
+        
+        return X, Y
     
-def prepare_data(csv_path, seq_len=12):
+def prepare_data(csv_path, seq_len=48):
     print("Loading processed data...")
     df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
     
@@ -30,89 +49,117 @@ def prepare_data(csv_path, seq_len=12):
     
     print(f"Detected {num_nodes} zones and {num_weather} weather features.")
     
-    # Reshape the flat table into a 3D tensor
+    # Build the array ONCE, directly in float32 to save RAM
     time_steps = len(df)
-    node_features = np.zeros((time_steps, num_nodes, num_features))
+    node_features = np.zeros((time_steps, num_nodes, num_features), dtype=np.float32)
     
-    demand_data = df[zone_cols].values
-    weather_data = df[weather_cols].values
+    demand_data = df[zone_cols].values.astype(np.float32)
+    weather_data = df[weather_cols].values.astype(np.float32)
     
     node_features[:, :, 0] = demand_data
     for w in range(num_weather):
-        # Broadcast the weather feature across all nodes for each time step
         node_features[:, :, 1 + w] = weather_data[:, w].reshape(-1, 1)
         
-    # Create the sliding windows
-    print("Creating sequential windows...")
-    X, Y, valid_dates = [], [], []
-    for i in range(time_steps - seq_len):
-        X.append(node_features[i : i + seq_len])
-        # The target is just the demand of the next time step
-        Y.append(demand_data[i + seq_len]) 
-        valid_dates.append(df.index[i + seq_len])
-        
-    X = np.array(X)
-    Y = np.expand_dims(np.array(Y), axis=-1)
-    dates = pd.DatetimeIndex(valid_dates)
+    print("Executing chronological split (Jan-May Train / June Test)...")
+    valid_indices = np.arange(time_steps - seq_len)
+    valid_dates = df.index[valid_indices + seq_len]
     
-    # Train on 2024, Test on 2025
-    print("Executing chronological split (2024 Train / 2025 Test)...")
-    train_mask = dates.year == 2024
-    test_mask = dates.year == 2025
+    # Train on the first 5 months of 2024
+    train_mask = (valid_dates.year == 2024) & (valid_dates.month <= 5)
     
-    X_train, Y_train = X[train_mask], Y[train_mask]
-    X_test, Y_test = X[test_mask], Y[test_mask]
+    # Test on June 2024 (guaranteed real, fluctuating data)
+    test_mask = (valid_dates.year == 2024) & (valid_dates.month == 6)
     
-    return X_train, Y_train, X_test, Y_test, num_nodes, num_features
+    train_indices = valid_indices[train_mask]
+    test_indices = valid_indices[test_mask]
+    
+    return node_features, demand_data, train_indices, test_indices, num_nodes, num_features
 
 def train_model():
-    X_train, Y_train, X_test, Y_test, num_nodes, num_features = prepare_data('processed/final_stgat_input.csv', seq_len=12)
+# 1. Receive the flat arrays and indices
+    node_features, demand_data, train_indices, test_indices, num_nodes, num_features = prepare_data('processed/final_stgat_input.csv', seq_len=48)
     adj_matrix = np.load('processed/adjacency_matrix.npy')
     
-    # Convert adjacency matrix to edge index format for PyTorch Geometric
     edges = np.argwhere(adj_matrix == 1)
     edge_index = torch.tensor(edges.T, dtype=torch.long)
     
-    train_dataset = NYCTaxiDataset(X_train, Y_train)
+    # 2. Pass them to the updated Dataset
+    train_dataset = NYCTaxiDataset(node_features, demand_data, train_indices, seq_len=48)
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     
-    # Setup device and model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nInitializing model on {device}...")
-    
-    model = STGAT(in_channels=num_features, hidden_channels=64, out_channels=1, num_nodes=num_nodes).to(device)
     edge_index = edge_index.to(device)
     
-    # Optimization setup
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    # 3. Setup Grid Search
+    hidden_dims = [64] 
+    learning_rates = [0.001]
+    epochs = 30
     
-    # Training Loop
-    epochs = 10
-    print("Starting Training...")
+    best_loss = float('inf')
+    best_params = {}
     
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0
+    # 4. Wrap your original loop in the itertools product
+    for hidden_dim, lr in itertools.product(hidden_dims, learning_rates):
+        print(f"\n--- Training Phase 2: hidden_channels={hidden_dim}, lr={lr}, epochs={epochs} ---")
+            
+        model = STGAT(in_channels=num_features, hidden_channels=hidden_dim, out_channels=1, num_nodes=num_nodes).to(device)
         
-        for batch_X, batch_Y in train_loader:
-            batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
-            
-            optimizer.zero_grad()
-            predictions = model(batch_X, edge_index)
-            
-            loss = criterion(predictions, batch_Y)
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-            
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch [{epoch+1}/{epochs}] - Training MSE Loss: {avg_loss:.4f}")
+        # PHASE 2: Swapped to Huber Loss
+        criterion = nn.HuberLoss() 
         
-    # Save the trained model weights
-    torch.save(model.state_dict(), 'models/stgat_weights.pth')
-    print("Training complete! Model saved to models/stgat_weights.pth.")
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, fused=True)
+        # We can increase the step_size since we are running 30 epochs now
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+            
+        # 5. Add the Learning Rate Scheduler
+        scaler = torch.amp.GradScaler('cuda')
+            
+        for epoch in range(epochs):
+            model.train()
+            total_loss = 0
+            
+            # 1. Wrap your train_loader with tqdm
+            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+            
+            for batch_X, batch_Y in progress_bar:
+                batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
+                optimizer.zero_grad()
+                
+                # Use autocast for the forward pass (if using AMP)
+                with torch.amp.autocast('cuda'):
+                    predictions = model(batch_X, edge_index)
+                    loss = criterion(predictions, batch_Y)
+                
+                # Scaled backward pass and optimizer step
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                
+                total_loss += loss.item()
+                
+
+
+                
+                # 2. Update the progress bar text with the current batch loss
+                progress_bar.set_postfix({'Batch Loss': f"{loss.item():.4f}"})
+                
+            scheduler.step() 
+            
+            avg_loss = total_loss / len(train_loader)
+            current_lr = scheduler.get_last_lr()[0]
+            
+            # Updated to say 'Huber Loss'
+            print(f"Epoch [{epoch+1}/{epochs}] Completed - Avg Huber Loss: {avg_loss:.4f} (LR: {current_lr:.6f})")
+            
+        # Save the best model
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            best_params = {'hidden_dim': hidden_dim, 'lr': lr}
+            torch.save(model.state_dict(), 'models/stgat_weights_best.pth')
+            print(f"** New best model saved! Huber Loss: {best_loss:.4f} **")
+            
+    print(f"\nGrid Search Complete! Best parameters: {best_params} with final Training MSE: {best_loss:.4f}")
 
 if __name__ == "__main__":
     train_model()

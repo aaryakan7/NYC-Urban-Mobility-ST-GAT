@@ -11,36 +11,41 @@ def process_trip_data(yellow_pattern, fhv_pattern):
     
     print(f"Found {len(yellow_files)} Yellow Taxi files and {len(fhv_files)} FHV files.")
     
-    # Process all Yellow Taxi files
-    print("Loading and combining Yellow Taxi Data...")
-    yellow_dfs = []
+    aggregated_dfs = []
+    
+    # Process all Yellow Taxi files iteratively
+    print("Processing Yellow Taxi Data file-by-file...")
     for file in yellow_files:
         df = pd.read_parquet(file)
         df = df[(df['passenger_count'] > 0) & (df['trip_distance'] > 0)]
-        df = df[['tpep_pickup_datetime', 'PULocationID']].copy()
-        df.rename(columns={'tpep_pickup_datetime': 'pickup_datetime'}, inplace=True)
-        yellow_dfs.append(df)
-        
-    df_yellow = pd.concat(yellow_dfs, ignore_index=True) if yellow_dfs else pd.DataFrame()
+        if 'tpep_pickup_datetime' in df.columns:
+            df.rename(columns={'tpep_pickup_datetime': 'pickup_datetime'}, inplace=True)
+            
+        # Aggregate immediately to save memory
+        df['time_bin'] = df['pickup_datetime'].dt.floor('15min')
+        agg_df = df.groupby(['time_bin', 'PULocationID']).size().reset_index(name='demand')
+        aggregated_dfs.append(agg_df)
 
-    # Process all FHV files
-    print("Loading and combining High Volume FHV (Uber/Lyft) Data...")
-    fhv_dfs = []
+    # Process all FHV files iteratively
+    print("Processing High Volume FHV (Uber/Lyft) Data file-by-file...")
     for file in fhv_files:
         df = pd.read_parquet(file)
         if 'pickup_datetime' in df.columns and 'PULocationID' in df.columns:
-            df = df[['pickup_datetime', 'PULocationID']].copy()
-            fhv_dfs.append(df)
-            
-    df_fhv = pd.concat(fhv_dfs, ignore_index=True) if fhv_dfs else pd.DataFrame()
+            # Aggregate immediately
+            df['time_bin'] = df['pickup_datetime'].dt.floor('15min')
+            agg_df = df.groupby(['time_bin', 'PULocationID']).size().reset_index(name='demand')
+            aggregated_dfs.append(agg_df)
 
-    # Combine all months and floor to 15-minute intervals
-    print("Aggregating into 15-minute intervals...")
-    df_combined = pd.concat([df_yellow, df_fhv], ignore_index=True)
-    df_combined['time_bin'] = df_combined['pickup_datetime'].dt.floor('15min')
+    # Combine the already-aggregated dataframes
+    print("Combining aggregated data...")
+    if not aggregated_dfs:
+        return pd.DataFrame()
+        
+    df_combined = pd.concat(aggregated_dfs, ignore_index=True)
 
-    # Aggregate demand per zone per 15-min window
-    demand_df = df_combined.groupby(['time_bin', 'PULocationID']).size().reset_index(name='demand')
+    # Group one last time to sum overlapping bins (e.g., FHV and Yellow in the same 15min block)
+    print("Finalizing 15-minute interval demand matrix...")
+    demand_df = df_combined.groupby(['time_bin', 'PULocationID'])['demand'].sum().reset_index()
 
     # Pivot to have zones as columns and time bins as rows
     demand_matrix = demand_df.pivot(index='time_bin', columns='PULocationID', values='demand').fillna(0)
@@ -78,6 +83,15 @@ def integrate_weather_and_scale(demand_matrix, weather_path):
     # Merge weather with trip demand data on the time index
     merged_df = demand_matrix.join(df_weather_15m, how='left').ffill().bfill()
     
+    # Sine/Cosine Cyclic Transformations
+    decimal_hour = merged_df.index.hour + (merged_df.index.minute / 60.0)
+    day_of_week = merged_df.index.dayofweek
+    
+    merged_df['hour_sin'] = np.sin(2 * np.pi * decimal_hour / 24.0)
+    merged_df['hour_cos'] = np.cos(2 * np.pi * decimal_hour / 24.0)
+    merged_df['dow_sin'] = np.sin(2 * np.pi * day_of_week / 7.0)
+    merged_df['dow_cos'] = np.cos(2 * np.pi * day_of_week / 7.0)
+
     # Convert all column names to strings for scikit-learn
     merged_df.columns = merged_df.columns.astype(str)
     
