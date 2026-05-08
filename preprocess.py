@@ -2,6 +2,7 @@ import pandas as pd
 import geopandas as gpd
 import numpy as np
 import glob
+import pickle
 from sklearn.preprocessing import StandardScaler
 
 def process_trip_data(yellow_pattern, fhv_pattern):
@@ -98,6 +99,9 @@ def integrate_weather_and_scale(demand_matrix, weather_path):
     # Apply standard scaling
     scaler = StandardScaler()
     scaled_data = scaler.fit_transform(merged_df)
+
+    with open('processed/scaler.pkl', 'wb') as f:
+        pickle.dump(scaler, f)
     
     # Final dataframe
     final_df = pd.DataFrame(scaled_data, index=merged_df.index, columns=merged_df.columns)
