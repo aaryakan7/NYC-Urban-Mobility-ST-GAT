@@ -1,6 +1,6 @@
 # NYC Urban Mobility ST-GAT
 
-A deep learning pipeline leveraging Spatio-Temporal Graph Attention Networks (ST-GAT) to forecast ride-hailing demand across 263 New York City Taxi and Limousine Commission (TLC) zones. By fusing historical mobility data with real-time weather and engineered cyclical time features, this model achieves an **84.42% predictive accuracy** on unseen future traffic data.
+A deep learning pipeline leveraging Spatio-Temporal Graph Attention Networks (ST-GAT) to forecast ride-hailing demand across 263 New York City Taxi and Limousine Commission (TLC) zones. By fusing historical mobility data with real-time weather and engineered cyclical time features, this model achieves a **15.58% weighted mean average percentage error** on unseen June 2024 demand data.
 
 This project was developed for the CS 439 final project at Rutgers University.
 
@@ -20,9 +20,9 @@ Traditional time-series forecasting treats geographic zones as isolated environm
 
 The model was trained on Jan-May 2024 data and strictly evaluated on unseen June 2024 data to prevent temporal data leakage. 
 
-* **Overall Accuracy:** 84.42% (WMAPE: 15.58%)
-* **Rush Hour Accuracy:** 85.56%
-* **Improvement:** Outperformed the Naive Historical Baseline by over 39% in Mean Squared Error (MSE).
+* **Overall WMAPE:** 15.58%
+* **Rush Hour WMAPE:** 14.44%
+* **Baseline Improvement:** >39% reduction in MSE versus a naive persistence baseline
 * **Ablation Study:** Permutation feature importance revealed that **Apparent Temperature** and **Temperature (2m)** are the heaviest exogenous drivers of urban mobility, followed closely by precipitation and snow.
 
 ---
